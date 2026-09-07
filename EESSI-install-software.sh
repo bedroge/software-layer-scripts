@@ -17,37 +17,6 @@ display_help() {
   echo "  --skip-cuda-install    -  disable installing a full CUDA SDK in the host_injections prefix (e.g. in CI)"
 }
 
-function copy_build_log() {
-    # copy specified build log to specified directory, with some context added
-    build_log=${1}
-    build_logs_dir=${2}
-
-    # also copy to build logs directory, if specified
-    if [ ! -z "${build_logs_dir}" ]; then
-        log_filename="$(basename ${build_log})"
-        if [ ! -z "${SLURM_JOB_ID}" ]; then
-            # use subdirectory for build log in context of a Slurm job
-            build_log_path="${build_logs_dir}/jobs/${SLURM_JOB_ID}/${log_filename}"
-        else
-            build_log_path="${build_logs_dir}/non-jobs/${log_filename}"
-        fi
-        mkdir -p $(dirname ${build_log_path})
-        cp -a ${build_log} ${build_log_path}
-        chmod 0644 ${build_log_path}
-
-        # add context to end of copied log file
-        echo >> ${build_log_path}
-        echo "Context from which build log was copied:" >> ${build_log_path}
-        echo "- original path of build log: ${build_log}" >> ${build_log_path}
-        echo "- working directory: ${PWD}" >> ${build_log_path}
-        echo "- Slurm job ID: ${SLURM_OUT}" >> ${build_log_path}
-        echo "- EasyBuild version: ${eb_version}" >> ${build_log_path}
-        echo "- easystack file: ${easystack_file}" >> ${build_log_path}
-
-        echo "EasyBuild log file ${build_log} copied to ${build_log_path} (with context appended)"
-    fi
-}
-
 function safe_module_use {
     # add a given non-empty directory to $MODULEPATH if and only if it is not yet in
     directory=${1}
@@ -216,9 +185,9 @@ fi
 pr_diff=$(ls [0-9]*.diff | head -n 1)
 export PR_DIFF="$PWD/$pr_diff"
 
-# Only run install_scripts.sh if not in dev.eessi.io (for security)
-# Also skip installing scripts for site-installs
-if [[ -z ${EESSI_DEV_PROJECT} && -z "${EESSI_SITE_INSTALL_FORCE}" ]]; then
+# Only run install_scripts.sh for software.eessi.io builds,
+# i.e. skip it for site-installs (which also includes builds for dev.eessi.io)
+if [[ -z "${EESSI_SITE_INSTALL_FORCE}" ]]; then
     ${TOPDIR}/install_scripts.sh --prefix ${EESSI_CVMFS_REPO}/versions/${EESSI_VERSION} --eessi-version ${EESSI_VERSION}
 fi
 
@@ -325,16 +294,6 @@ fi
 export EASYBUILD_INSTALLPATH=${EESSI_PREFIX}/software/${EESSI_OS_TYPE}/${EESSI_SOFTWARE_SUBDIR_OVERRIDE}
 echo "EASYBUILD_INSTALLPATH set to $EASYBUILD_INSTALLPATH"
 
-# If in dev.eessi.io, allow building on top of software.eessi.io via EESSI-extend
-if [[ ! -z ${EESSI_DEV_PROJECT} ]]; then
-    # We keep track of the old install path for settings paths to SitePackage.lua and .lmodrc later
-    EASYBUILD_INSTALLPATH_STANDARD=${EASYBUILD_INSTALLPATH}
-    # Need to unset $EESSI_CVMFS_INSTALL to use $EESSI_PROJECT_INSTALL
-    unset EESSI_CVMFS_INSTALL
-    export EESSI_PROJECT_INSTALL=${EESSI_CVMFS_REPO_OVERRIDE}
-    echo ">> \$EESSI_PROJECT_INSTALL set to ${EESSI_PROJECT_INSTALL}"
-fi
-
 # If we have EESSI_ACCELERATOR_TARGET_OVERRIDE set (and non-empty), then this implies building for a GPU target
 # (this must be set _before_ we load EESSI-extend).
 # We also make sure that EESSI_ACCELERATOR_TARGET is also set as EESSI_ACCELERATOR_TARGET_OVERRIDE must
@@ -344,6 +303,10 @@ if [[ -n "$EESSI_ACCELERATOR_TARGET_OVERRIDE" && -z "$EESSI_ACCELERATOR_TARGET" 
 elif [[ -n "$EESSI_ACCELERATOR_TARGET_OVERRIDE" ]]; then
   export EESSI_ACCELERATOR_INSTALL=1
 fi
+
+# Make sure we use the hooks from the local software-layer-scripts clone:
+export EESSI_EASYBUILD_HOOKS_OVERRIDE=$TOPDIR/eb_hooks.py
+echo "Set EESSI_EASYBUILD_HOOKS_OVERRIDE to ${EESSI_EASYBUILD_HOOKS_OVERRIDE}"
 
 echo "DEBUG: before loading EESSI-extend // EASYBUILD_INSTALLPATH='${EASYBUILD_INSTALLPATH}'"
 source $TOPDIR/load_eessi_extend_module.sh ${EESSI_VERSION}
@@ -356,9 +319,11 @@ echo "DEBUG: after loading EESSI-extend //  EASYBUILD_INSTALLPATH='${EASYBUILD_I
 # Allow skipping CUDA SDK install in e.g. CI environments
 echo "Going to install full CUDA SDK and cu* libraries under host_injections if necessary"
 temp_install_storage=${TMPDIR}/temp_install_storage
+# Make sure that we use the easystack files from the git repository, which has an additional subdirectory ${EESSI_VERSION} at the end
+export NVIDIA_EASYSTACKS_DIRECTORY=${TOPDIR}/scripts/gpu_support/nvidia/easystacks/${EESSI_VERSION}
 mkdir -p ${temp_install_storage}
 if [ -z "${skip_cuda_install}" ] || [ ! "${skip_cuda_install}" ]; then
-    ${EESSI_PREFIX}/scripts/gpu_support/nvidia/install_cuda_and_libraries.sh \
+    ${TOPDIR}/scripts/gpu_support/nvidia/install_cuda_and_libraries.sh \
         -t ${temp_install_storage} \
         --accept-cuda-eula \
         --accept-cudnn-eula
@@ -370,7 +335,7 @@ fi
 if nvidia_gpu_available; then
     echo "Installing NVIDIA drivers for use in prefix shell..."
     # Site installs override EESSI_CVMFS_REPO, but link_nvidia_host_libraries should always use the usptream EESSI CVMFS repo
-    EESSI_CVMFS_REPO=/cvmfs/software.eessi.io ${EESSI_PREFIX}/scripts/gpu_support/nvidia/link_nvidia_host_libraries.sh
+    EESSI_CVMFS_REPO=/cvmfs/software.eessi.io ${TOPDIR}/scripts/gpu_support/nvidia/link_nvidia_host_libraries.sh
 fi
 
 # Now that we are done with all installs that should go the /cvmfs/software.eessi.io
@@ -384,7 +349,7 @@ if [[ ! -z "${EESSI_SITE_INSTALL}" && ! -z "${EESSI_SITE_SOFTWARE_PREFIX}" ]]; t
     module load EESSI/${EESSI_VERSION_BACKUP}
     # Use --ignore_cache in case the current build was the one that installed this EESSI-extend module
     echo "Loading EESSI-extend/${EESSI_VERSION}"
-    module load --ignore_cache EESSI-extend/${EESSI_VERSION}-easybuild
+    module --ignore_cache load EESSI-extend/${EESSI_VERSION}-easybuild
     echo "EASYBUILD_INSTALLPATH=${EASYBUILD_INSTALLPATH}"
 fi
 
@@ -496,14 +461,8 @@ else
 fi
 
 echo "DEBUG: before creating/updating lmod config files // EASYBUILD_INSTALLPATH='${EASYBUILD_INSTALLPATH}'"
-if [[ ! -z ${EESSI_DEV_PROJECT} ]]; then
-    # Make sure .lmod files are not checked for dev.eeessi.io
-    export LMOD_CONFIG_DIR="${EASYBUILD_INSTALLPATH_STANDARD}/.lmod"
-    export LMOD_PACKAGE_PATH="${EASYBUILD_INSTALLPATH_STANDARD}/.lmod"
-else
-    export LMOD_CONFIG_DIR="${EASYBUILD_INSTALLPATH}/.lmod"
-    export LMOD_PACKAGE_PATH="${EASYBUILD_INSTALLPATH}/.lmod"
-fi
+export LMOD_CONFIG_DIR="${EASYBUILD_INSTALLPATH}/.lmod"
+export LMOD_PACKAGE_PATH="${EASYBUILD_INSTALLPATH}/.lmod"
 
 # If this is a site install, the old method of checking if lmodrc.lua was updated doesn't work
 # We simply skip that step for now - it's hardly ever changed anyway

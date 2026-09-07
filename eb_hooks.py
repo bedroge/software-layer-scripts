@@ -11,14 +11,17 @@ from typing import NamedTuple
 import easybuild.tools.environment as env
 from easybuild.easyblocks.generic.configuremake import obtain_config_guess
 from easybuild.framework.easyconfig.constants import EASYCONFIG_CONSTANTS
-from easybuild.framework.easyconfig.easyconfig import get_toolchain_hierarchy
+from easybuild.framework.easyconfig.easyconfig import (
+    get_toolchain_hierarchy,
+)
 from easybuild.tools import config
 from easybuild.tools.build_log import EasyBuildError, print_msg, print_warning
 from easybuild.tools.config import build_option, install_path, update_build_option
+from easybuild.tools.config import ERROR
 from easybuild.tools.filetools import apply_regex_substitutions, copy_dir, copy_file, remove_file, symlink, which
 from easybuild.tools.modules import get_software_root, get_software_root_env_var_name
 from easybuild.tools.run import run_cmd
-from easybuild.tools.systemtools import AARCH64, POWER, X86_64, det_parallelism, get_cpu_architecture, get_cpu_features
+from easybuild.tools.systemtools import AARCH64, POWER, X86_64, det_parallelism, get_cpu_architecture, get_cpu_features, get_gpu_info
 from easybuild.tools.toolchain.compiler import OPTARCH_GENERIC
 from easybuild.tools.toolchain.toolchain import is_system_toolchain
 from easybuild.tools.version import VERSION as EASYBUILD_VERSION
@@ -47,6 +50,7 @@ EESSI_MODULE_ONLY_ATTR = 'orig_module_only'
 EESSI_FORCE_ATTR = 'orig_force'
 EESSI_SUPPORTED_MODULE_ATTR = 'eessi_supported_module'
 EESSI_UNSUPPORTED_MODULE_ATTR = 'eessi_unsupported_module'
+EESSI_SANITYCHECK_CUDA_ATTR = 'eessi_sanitycheck_initial_env_path'
 
 SYSTEM = EASYCONFIG_CONSTANTS['SYSTEM'][0]
 
@@ -70,23 +74,27 @@ EESSI_SUPPORTED_TOP_LEVEL_TOOLCHAINS = {
         {'name': 'foss', 'version': '2025a'},
         {'name': 'foss', 'version': '2025b'},
     ],
+    '2026.06': [
+        {'name': 'foss', 'version': '2026.1'},
+        {'name': 'lfoss', 'version': '2026.1'},
+    ],
 }
 if EASYBUILD_VERSION >= '5.2.0':
     EESSI_SUPPORTED_TOP_LEVEL_TOOLCHAINS['2025.06'].append(
         {'name': 'lfoss', 'version': '2025b'}
     )
 
-if EASYBUILD_VERSION >= '5.3.0':
+if EASYBUILD_VERSION >= '5.3.1':
     EESSI_SUPPORTED_TOP_LEVEL_TOOLCHAINS['2025.06'].append(
-        {'name': 'rocm-compilers', 'version': '19.0.0-ROCm-6.4.1'}
+        {'name': 'rompi', 'version': '2025a'}
     )
 
 # Supported compute capabilities by CUDA toolkit version
-# Obtained by installing all CUDAs from 12.0.0 to 13.1.0, then using:
+# Obtained by installing all CUDAs from 12.0.0 to 13.3.0, then using:
 
 # #!/bin/bash
 #
-# CUDA_VERS=(12.0.0 12.1.0 12.1.1 12.2.0 12.2.2 12.3.0 12.3.2 12.4.0 12.5.0 12.6.0 12.8.0 12.9.0 12.9.1 13.0.0 13.0.1 13.0.2 13.1.0)
+# CUDA_VERS=(12.0.0 12.1.0 12.1.1 12.2.0 12.2.2 12.3.0 12.3.2 12.4.0 12.5.0 12.6.0 12.8.0 12.9.0 12.9.1 13.0.0 13.0.1 13.0.2 13.1.0 13.1.1 13.2.0 13.3.0)
 #
 # for ver in ${CUDA_VERS[@]}; do
 #     module load CUDA/${ver}
@@ -114,6 +122,9 @@ CUDA_SUPPORTED_CCS = {
     '13.0.1': ['75', '80', '86', '87', '88', '89', '90', '100', '110', '103', '120', '121'],
     '13.0.2': ['75', '80', '86', '87', '88', '89', '90', '100', '110', '103', '120', '121'],
     '13.1.0': ['75', '80', '86', '87', '88', '89', '90', '100', '110', '103', '120', '121'],
+    '13.1.1': ['75', '80', '86', '87', '88', '89', '90', '100', '110', '103', '120', '121'],
+    '13.2.0': ['75', '80', '86', '87', '88', '89', '90', '100', '110', '103', '120', '121'],
+    '13.3.0': ['75', '80', '86', '87', '88', '89', '90', '100', '110', '103', '120', '121'],
 }
 
 # Ensure that we don't print any messages in --terse mode
@@ -239,7 +250,10 @@ def get_eessi_envvar(eessi_envvar):
     return eessi_envvar_value
 
 
-def get_rpath_override_dirs(software_name):
+def get_rpath_override_dirs(software_name=None, stub_suffix=""):
+    if software_name is None:
+        raise EasyBuildError("This function should not be called without setting software_name")
+
     # determine path to installations in software layer via $EESSI_SOFTWARE_PATH
     eessi_software_path = get_eessi_envvar('EESSI_SOFTWARE_PATH')
 
@@ -252,7 +266,7 @@ def get_rpath_override_dirs(software_name):
         software_name,
         # We can't know the version, but this allows the use of a symlink
         # to facilitate version upgrades without removing files
-        'system',
+        f"system{'-' if stub_suffix else ''}{stub_suffix}",
     )
 
     # Allow for libraries in lib or lib64
@@ -430,8 +444,16 @@ def pre_prepare_hook(self, *args, **kwargs):
 
     # Inject an RPATH override for MPI (if needed)
     if mpi_family:
-        # Get list of override directories
-        mpi_rpath_override_dirs = get_rpath_override_dirs(mpi_family)
+        mpi_rpath_override_dirs = []
+        # If the package relies on CUDA or ROCm, the MPI layer may require different overrides
+        # for different CUDA/ROCm versions with specific compiler families
+        if self.cfg.eessi_gpu_dependency:
+            gpu_stub = f"{self.toolchain.COMPILER_FAMILY}-{self.cfg.eessi_gpu_dependency[0]}-{self.cfg.eessi_gpu_dependency[1]}"
+            mpi_rpath_override_dirs += get_rpath_override_dirs(software_name=mpi_family, stub_suffix=gpu_stub)
+        # We also may require OpenMP runtimes, which are compiler family dependent
+        mpi_rpath_override_dirs += get_rpath_override_dirs(software_name=mpi_family, stub_suffix=f"{self.toolchain.COMPILER_FAMILY}")
+        # Get list of default override directories
+        mpi_rpath_override_dirs += get_rpath_override_dirs(software_name=mpi_family)
 
         # update the relevant option (but keep the original value so we can reset it later)
         if hasattr(self, EESSI_RPATH_OVERRIDE_ATTR):
@@ -937,6 +959,64 @@ def post_module_hook_unsupported_module(self, *args, **kwargs):
                 del self.initial_environ[unsup_mod.envvar]
 
 
+def pre_sanitycheck_hook(self, *args, **kwargs):
+    """Main pre-sanitycheck hook: trigger custom functions."""
+    pre_sanitycheck_hook_cuda(self, *args, **kwargs)
+
+
+def post_sanitycheck_hook(self, *args, **kwargs):
+    """Main post-sanitycheck hook: trigger custom functions."""
+    post_sanitycheck_hook_cuda(self, *args, **kwargs)
+
+
+def pre_sanitycheck_hook_cuda(self, *args, **kwargs):
+    """
+    If CUDA is a build-only dependency (demoted to build dep by inject_gpu_property),
+    temporarily load the module so CUDA tool cuobjdump path can be made
+    available during the sanity check step.
+    This is needed since EasyBuild 5.4.0 where build deps are no longer available
+    during the sanity check.
+    """
+    cudaver = get_dependency_software_version("CUDA", ec=self.cfg, check_deps=False, check_builddeps=True)
+    if cudaver and EASYBUILD_VERSION >= '5.4.0':
+        # Get the CUDA dependency info from builddependencies
+        build_deps = self.cfg.get_ref('builddependencies')
+        for dep in build_deps:
+            if dep['name'] == 'CUDA':
+                # Load CUDA module
+                self.modules_tool.load([dep['full_mod_name']])
+                cuobjdump_path = which('cuobjdump', on_error=ERROR)
+                cuobjdump_dir = os.path.dirname(cuobjdump_path)
+                self.cuobjdump_dir = cuobjdump_dir
+                self.modules_tool.unload([dep['full_mod_name']])
+                # Store the original PATH for restoration in post hook
+                original_initial_environ_path = self.initial_environ['PATH']
+                setattr(self, EESSI_SANITYCHECK_CUDA_ATTR, original_initial_environ_path)
+                # Modify stored initial environment (restored during the sanity check), not the current environment
+                self.initial_environ['PATH'] = original_initial_environ_path + os.pathsep + cuobjdump_dir
+                print_msg(f"Add location of cuobjdump ({cuobjdump_dir}) to initial environ PATH for CUDA sanity check")
+                break
+
+
+def post_sanitycheck_hook_cuda(self, *args, **kwargs):
+    """
+    Reverse the temporary CUDA dependency promotion from pre_sanitycheck_hook_cuda.
+    """
+    if hasattr(self, EESSI_SANITYCHECK_CUDA_ATTR):
+        original_path = getattr(self, EESSI_SANITYCHECK_CUDA_ATTR)
+
+        if not isinstance(original_path, str) or os.pathsep not in original_path:
+            raise EasyBuildError(
+                f"Expected {EESSI_SANITYCHECK_CUDA_ATTR} attribute to contain a PATH-like "
+                f"value, but got: {original_path}"
+            )
+
+        # Restore the original initial environ PATH
+        print_msg(f"Restoring stored initial environ PATH after CUDA sanity check")
+        self.initial_environ['PATH'] = original_path
+        delattr(self, EESSI_SANITYCHECK_CUDA_ATTR)
+
+
 def post_easyblock_hook_copy_easybuild_subdir(self, *args, **kwargs):
     """
     Post easyblock hook that copies the easybuild subdirectory of every installed application
@@ -948,7 +1028,12 @@ def post_easyblock_hook_copy_easybuild_subdir(self, *args, **kwargs):
     now_utc_timestamp = datetime.datetime.now(datetime.UTC).strftime('%Y%m%d_%H%M%S%Z')
     app_easybuild_dir = os.path.join(self.installdir, config.log_path(ec=self.cfg))
     app_reprod_dir = os.path.join(stack_reprod_dir, self.install_subdir, now_utc_timestamp, 'easybuild')
-    copy_dir(app_easybuild_dir, app_reprod_dir)
+    # take into account that 'easybuild' subdirectory may not exist yet,
+    # for example in case of installations that failed because source files could not be downloaded
+    if os.path.exists(app_easybuild_dir):
+        copy_dir(app_easybuild_dir, app_reprod_dir)
+    else:
+        self.log.warning(f"{app_easybuild_dir} was *not* copied to {app_reprod_dir}, because it does not exist!")
 
 
 def pre_prepare_hook_cuda_dependant(self, *args, **kwargs):
@@ -1128,21 +1213,30 @@ def pre_configure_hook_BLIS(self, *args, **kwargs):
 
 def pre_configure_hook_CUDA_Samples_test_remove(self, *args, **kwargs):
     """skip immaTensorCoreGemm in CUDA-Samples for compute capability 7.0."""
-    if self.name == 'CUDA-Samples' and self.version in ['12.1']:
-        # Get compute capability from build option
-        cuda_caps = build_option('cuda_compute_capabilities')
-        # Check if compute capability 7.0 is in the list
-        if cuda_caps and '7.0' in cuda_caps:
-            print_msg("Applying hook for CUDA-Samples %s with compute capability 7.0", self.version)
-            # local_filters is set by the easyblock, remove path to the Makefile instead
-            makefile_path = os.path.join(self.start_dir, 'Samples/3_CUDA_Features/immaTensorCoreGemm/Makefile')
-            if os.path.exists(makefile_path):
-                remove_file(makefile_path)
-                print_msg("Removed Makefile at %s to skip immaTensorCoreGemm build", makefile_path)
-            else:
-                print_msg("Makefile not found at %s", makefile_path)
-    else:
-        raise EasyBuildError("CUDA-Samples-specific hook triggered for non-CUDA-Samples easyconfig?!")
+    if self.name == 'CUDA-Samples':
+        if self.version in ['12.1', '12.9']:
+            # Get compute capability from build option
+            cuda_caps = build_option('cuda_compute_capabilities')
+            # Check if compute capability 7.0 is in the list
+            if cuda_caps and '7.0' in cuda_caps:
+                print_msg("Applying hook for CUDA-Samples %s with compute capability 7.0", self.version)
+                # local_filters is set by the easyblock, remove path to the Makefile instead
+                makefile_path = os.path.join(self.start_dir, 'Samples/3_CUDA_Features/immaTensorCoreGemm/Makefile')
+                # later versions use CMake rather than Makefiles
+                cmakefile_path = os.path.join(self.start_dir, 'Samples/3_CUDA_Features/CMakeLists.txt')
+                if os.path.exists(makefile_path):
+                    remove_file(makefile_path)
+                    print_msg("Removed Makefile at %s to skip immaTensorCoreGemm build", makefile_path)
+                elif os.path.exists(cmakefile_path):
+                    self.cfg.update(
+                        'preconfigopts',
+                        # Comment out the line that contains immaTensorCoreGemm
+                        "sed -i '17{/immaTensorCoreGemm/s/^/#/}' %s && " % cmakefile_path,
+                    )
+                else:
+                    print_msg("Makefile not found at %s", makefile_path)
+        else:
+            print_msg(f"CUDA-Samples hook triggered but no hook needed for version {self.version}")
 
 
 def pre_configure_hook_grass(self, *args, **kwargs):
@@ -1184,6 +1278,45 @@ def pre_configure_hook_score_p(self, *args, **kwargs):
 
     else:
         raise EasyBuildError("Score-P-specific hook triggered for non-Score-P easyconfig?!")
+
+
+def pre_configure_hook_symengine(self, *args, **kwargs):
+    """
+    Pre-configure hook for SymEngine
+    """
+    if self.name == 'SymEngine':
+        # make sure that BFD (part of binutils) is found;
+        # full path depends on EESSI version and CPU family,
+        # something like ${EESSI_PREFIX}/usr/lib64/binutils/aarch64-unknown-linux-gnu/2.44/*
+        # or ${EESSI_PREFIX}/usr/lib64/binutils/x86_64-pc-linux-gnu/2.44/*
+        compat_layer_topdir = get_eessi_envvar('EESSI_EPREFIX')
+        libbfd_path_pattern = os.path.join(compat_layer_topdir, 'usr', 'lib64', 'binutils', '*-linux-gnu', '*', 'libbfd.so')
+        res = glob.glob(libbfd_path_pattern)
+        if res:
+            libbfd_path = res[0]
+            bfd_topdir = os.path.dirname(libbfd_path)
+            bfd_include_path = os.path.join(bfd_topdir, 'include')
+            if os.path.isdir(bfd_include_path):
+                self.cfg.update('configopts', f"-DBFD_INCLUDE_DIR={bfd_include_path}")
+                self.cfg.update('configopts', f"-DBFD_LIBRARY={libbfd_path}")
+                # add path to libbfd.so to $LIBRARY_PATH, so it gets added to RPATH section
+                library_path = os.getenv('LIBRARY_PATH')
+                os.environ['LIBRARY_PATH'] = f'{library_path}:{bfd_topdir}'
+            else:
+                raise EasyBuildError(f"binutils include path {bfd_include_path} does not exist?!")
+        else:
+            raise EasyBuildError(f"No match found for {libbfd_path_pattern}")
+
+        # make sure correct installation of GMP/MPC/MPFR is picked up (from dependencies, not compat layer)
+        for dep in ('GMP', 'MPC', 'MPFR'):
+            dep_installdir = get_software_root(dep)
+            if dep_installdir:
+                self.cfg.update('configopts', f"-D{dep}_INCLUDE_DIR={dep_installdir}/include")
+                self.cfg.update('configopts', f"-D{dep}_LIBRARY={dep_installdir}/lib/lib{dep.lower()}.so")
+            else:
+                raise EasyBuildError(f"Path for {dep} installaiton directory not found")
+    else:
+        raise EasyBuildError("SymEngine-specific hook triggered for non-SymEngine easyconfig?!")
 
 
 def pre_configure_hook_dyninst(self, *args, **kwargs):
@@ -1329,6 +1462,18 @@ def pre_configure_hook_llvm(self, *args, **kwargs):
                     item.deps.append(sftw)
 
         recursive_set_deps(self, softwares=('zlib', 'ncurses'))
+
+        # More ignorable tests and patch to avoid treating `__unused` as a non-reserved name
+        # https://github.com/EESSI/software-layer/pull/1583
+        if self.version == '21.1.8':
+            self.cfg.update('test_suite_ignore_patterns', 'Clang :: Driver/aarch64-toolchain-extra.c')
+            self.cfg.update('test_suite_ignore_patterns', 'Clang :: Driver/arm-toolchain-extra.c')
+            self.cfg.update('test_suite_ignore_patterns', 'libFuzzer-x86_64-default-Linux :: stack-overflow-with-asan.test')
+            self.cfg.update('test_suite_ignore_patterns', 'libFuzzer-x86_64-libcxx-Linux :: stack-overflow-with-asan.test')
+            self.cfg.update('test_suite_ignore_patterns', 'libFuzzer-x86_64-static-libcxx-Linux :: stack-overflow-with-asan.test')
+
+            sys_res_names_file = os.path.join(self.start_dir, 'libcxx', 'test', 'libcxx', 'system_reserved_names.gen.py')
+            apply_regex_substitutions(sys_res_names_file, [(r'^#define __unused SYSTEM_RESERVED_NAME', '')])
     else:
         raise EasyBuildError("LLVM-specific hook triggered for non-LLVM easyconfig?!")
 
@@ -1378,6 +1523,20 @@ def pre_configure_hook_openmpi_ipv6(self, *args, **kwargs):
             self.cfg.update('configopts', '--enable-ipv6')
     else:
         raise EasyBuildError("OpenMPI-specific hook triggered for non-OpenMPI easyconfig?!")
+
+
+def pre_configure_hook_petsc(self, *args, **kwargs):
+    """
+    Pre-configure hook for PETSc
+    - make sure that zlib is found in compat layer
+    """
+    if self.name == 'PETSc':
+        # only necessary for PETSc 3.24.0+
+        if LooseVersion(self.version) >= LooseVersion('3.24.0'):
+            compat_layer_topdir = get_eessi_envvar('EESSI_EPREFIX')
+            self.cfg.update('configopts', f'--with-zlib-dir={compat_layer_topdir}/usr')
+    else:
+        raise EasyBuildError("PETSc-specific hook triggered for non-PETSc easyconfig?!")
 
 
 def pre_configure_hook_pmix_ipv6(self, *args, **kwargs):
@@ -1601,6 +1760,18 @@ def pre_test_hook_lammps_ignore_failure_arm_generic(self, *args, **kwargs):
             self.cfg['test_cmd'] = test_cmd
 
 
+def pre_test_hook_perl_increase_test_timeout(self, *args, **kwargs):
+    """
+    Tests fail for different Perl versions in EESSI 2026.06 when run with standard timeout. So, increase timeout by a factor of 10.
+    See https://github.com/EESSI/software-layer/pull/1556#issuecomment-5183283054
+    """
+    eessi_version = get_eessi_envvar('EESSI_VERSION')
+    if self.name == 'Perl':
+        if eessi_version == '2026.06':
+            if self.version in ['5.38.0', '5.42.0']:
+                # increase timeout for Perl tests, to avoid flaky failures in tests like dist/threads/t/libc.t
+                env.setvar('PERL_TEST_TIME_OUT_FACTOR', '10')
+
 def pre_test_hook_ignore_failing_tests_SciPybundle(self, *args, **kwargs):
     """
     Pre-test hook for SciPy-bundle: skip failing tests for selected SciPy-bundle versions
@@ -1735,6 +1906,26 @@ def pre_test_hook_ignore_failing_tests_OpenBabel_a64fx(self, *args, **kwargs):
         self.cfg['testopts'] = "|| echo ignoring failing tests"
 
 
+def pre_test_hook_Siesta_ignore_failure_with_crosscompilation(self, *args, **kwargs):
+    """
+    Ignore failing tests when crosscompiling without gpu present.
+    """
+    if self.name == 'Siesta':
+        if self.version in ['5.4.2']:
+            if 'CUDA' in self.cfg['versionsuffix']:
+                cuda_cc = build_option('cuda_compute_capabilities')
+                if cuda_cc and not get_gpu_info():
+                    failing_tests=[
+                        "Solvers-si-qdot-elsi-elpa-gpu_mpi4_omp1", # runs cuda get device
+                        "Solvers-si-qdot-elsi-elpa-1stage-gpu_mpi4_omp1", # runs cuda get device
+                        "Solvers-si-qdot-elpa-native-gpu_mpi4_omp1", # runs cuda get device
+                        "Solvers-si-qdot-elpa-native-1stage-gpu_mpi4_omp1", # runs cuda get device
+                    ]
+                    extra_testopts = "|".join(failing_tests)
+                    testopts = self.cfg['testopts']
+                    self.cfg['testopts'] = re.sub(r"-E '(.*)'", rf"-E '\1|{extra_testopts}'", testopts)
+
+
 def pre_single_extension_hook(ext, *args, **kwargs):
     """Main pre-extension: trigger custom functions based on software name."""
     if ext.name in PRE_SINGLE_EXTENSION_HOOKS:
@@ -1774,6 +1965,26 @@ def pre_single_extension_numpy(ext, *args, **kwargs):
         if cpu_target == CPU_TARGET_A64FX:
             ext.orig_optarch = build_option('optarch')
             update_build_option('optarch', 'march=armv8.2-a')
+
+
+def pre_single_extension_hf_xet(ext, *args, **kwargs):
+    """
+    Pre-single-extension hook for hf_xet (extension of huggingface-hub) on aarch64/generic:
+    - inject a sed command into preinstallopts that patches data/Cargo.toml in the hf_xet
+      source to remove the "asm" feature from the sha2 dependency.
+      see https://github.com/huggingface/xet-core/issues/582
+    """
+    if ext.name in ['hf_xet', 'hf-xet'] and ext.version in ['1.1.7', '1.2.0']:
+        cpu_target = get_eessi_envvar('EESSI_SOFTWARE_SUBDIR')
+        if cpu_target == CPU_TARGET_AARCH64_GENERIC:
+            if ext.version == '1.1.7':
+                sed_cmd = r"""sed -i '/^sha2 = / s/, features = \["asm"\]//' data/Cargo.toml && """
+            elif ext.version == '1.2.0':
+                sed_cmd = r"""sed -i '/^sha2 = / s/, features = \["asm"\]//' ../data/Cargo.toml && """
+            ext.cfg['preinstallopts'] = sed_cmd + ext.cfg.get('preinstallopts', '')
+            ext.log.info("Injected data/Cargo.toml sha2 asm patch into preinstallopts for hf_xet on %s", cpu_target)
+    else:
+        raise EasyBuildError("hf_xet-specific extension hook triggered for non-hf_xet extension?!")
 
 
 def post_single_extension_numpy(ext, *args, **kwargs):
@@ -1998,38 +2209,101 @@ def replace_binary_non_distributable_files_with_symlinks(log, install_dir, pkg_n
                     symlink(host_inj_path, full_path)
 
 
+def find_rocm_llvm_dependency(ec):
+    """
+    Return the ROCm-LLVM dependency for this easyconfig, or None. ROCm-LLVM can
+    be a direct dependency, a direct toolchain component (rocm-compilers as the
+    toolchain), or one level deeper inside the rocm-compilers bundle when the
+    toolchain is rompi/rfbf/rfoss.
+    """
+    # Check if ROCm-LLVM is a direct dependency, and if so, return that
+    #
+    for dep in ec.asdict()['dependencies']:
+        # dep is a tuple (name, version, versionsuffix, toolchain); normalise it to the
+        # same dict format as ec.toolchain.tcdeps entries before returning
+        if dep[0] == 'ROCm-LLVM':
+            return {
+                'name': dep[0],
+                'version': dep[1],
+                'versionsuffix': dep[2] if len(dep) > 2 else '',
+                'toolchain': dep[3] if len(dep) > 3 else None,
+            }
+
+    # ROCm-LLVM can also be part of the toolchain. First, return early if this is NOT a ROCm-based toolchain
+    if ec['toolchain']['name'] not in ('rocm-compilers', 'rompi', 'rfbf', 'rfoss'):
+        return None
+
+    tcdeps = ec.toolchain.tcdeps or []
+    # Check if ROCm-LLVM is a direct dependency for this toolchain (which would be the case for rocm-compilers)
+    for dep in tcdeps:
+        if dep['name'] == 'ROCm-LLVM':
+            return dep
+    # For rompi, rfbf, rfoss, ROCm-LLVM is pulled in indirectly via rocm-compilers. the rocm-compilers
+    # toolchain dependency already encodes the ROCm version in its version string (e.g. '19.0.0-ROCm-6.4.1')
+    rocm_prefix = '-ROCm-'
+    for dep in tcdeps:
+        if dep['name'] == 'rocm-compilers':
+            full_version = dep['version'] + dep.get('versionsuffix', '')
+            if rocm_prefix in full_version:
+                version, rocm_version = full_version.split(rocm_prefix, 1)
+                return {
+                    'name': dep['name'],
+                    'version': version,
+                    'versionsuffix': rocm_prefix + rocm_version,
+                }
+
+    return None
+
+
 def inject_gpu_property(ec):
     """
     Add 'gpu' property and EESSI<PACKAGE>VERSION envvars via modluafooter
     easyconfig parameter, and drop dependencies to build dependencies
     """
     ec_dict = ec.asdict()
-    # Check if CUDA, cuDNN, you-name-it is in the dependencies, if so
-    # - drop dependency to build dependency
-    # - add 'gpu' Lmod property
-    # - add envvar with package version
-    pkg_names = ( "CUDA", "cuDNN" )
+
     pkg_versions = { }
     add_gpu_property = ''
 
-    for pkg_name in pkg_names:
-        # Check if pkg_name is in the dependencies, if so drop dependency to build
-        # dependency and set variable for later adding the 'gpu' Lmod property
-        # to '.remove' dependencies from ec_dict['dependencies'] we make a copy,
-        # iterate over the copy and can then savely use '.remove' on the original
-        # ec_dict['dependencies'].
-        deps = ec_dict['dependencies'][:]
-        if (pkg_name in [dep[0] for dep in deps]):
+    # Packages that define the accelerator ecosystem
+    top_level_accelerator_packages = ["CUDA", "ROCm"]
+    # Create a dependency property in the easyconfig instance that provides
+    # quick access to the CUDA/ROCm version
+    ec.eessi_gpu_dependency = ()
+
+    # Check if pkg_name is related to CUDA, if so drop dependency to build
+    # dependency and set variable for later adding the 'gpu' Lmod property
+    # to '.remove' dependencies from ec_dict['dependencies'] we make a copy,
+    # iterate over the copy and can then savely use '.remove' on the original
+    # ec_dict['dependencies'].
+    for pkg_name in ('CUDA', 'cuDNN'):
+        for dep in ec_dict['dependencies'][:]:
+            if dep[0] != pkg_name:
+                continue
+
             add_gpu_property = 'add_property("arch","gpu")'
-            for dep in deps:
-                if pkg_name == dep[0]:
-                    # make pkg_name a build dependency only (rpathing saves us from link errors)
-                    ec.log.info("Dropping dependency on %s to build dependency" % pkg_name)
-                    ec_dict['dependencies'].remove(dep)
-                    if dep not in ec_dict['builddependencies']:
-                        ec_dict['builddependencies'].append(dep)
-                    # take note of version for creating the modluafooter
-                    pkg_versions[pkg_name] = dep[1]
+
+            pkg_versions[pkg_name] = dep[1]
+
+            ec.log.info("Dropping dependency on %s to build dependency" % pkg_name)
+            ec_dict['dependencies'].remove(dep)
+            if dep not in ec_dict['builddependencies']:
+                ec_dict['builddependencies'].append(dep)
+
+    # ROCm-LLVM is handled separately: it is redistributable (kept as a runtime dep)
+    # and may be pulled in via a ROCm toolchain rather than as a direct dependency.
+    rocm_llvm_dep = find_rocm_llvm_dependency(ec)
+    if rocm_llvm_dep is not None:
+        add_gpu_property = 'add_property("arch","gpu")'
+        versionsuffix = rocm_llvm_dep['versionsuffix']
+        rocm_prefix = "-ROCm-"
+
+        if versionsuffix.startswith(rocm_prefix):
+            rocm_version = versionsuffix[len(rocm_prefix):]
+        else:
+            raise EasyBuildError(f"Invalid format for ROCm versionssuffix: {versionsuffix}")
+        pkg_versions['ROCm'] = rocm_version
+
     if add_gpu_property:
         ec.log.info("Injecting gpu as Lmod arch property and envvars for dependencies with their version")
         modluafooter = 'modluafooter'
@@ -2037,6 +2311,9 @@ def inject_gpu_property(ec):
         for pkg_name, version in pkg_versions.items():
             envvar = "EESSI%sVERSION" % pkg_name.upper()
             extra_mod_footer_lines.append('setenv("%s","%s")' % (envvar, version))
+            # Store the information about what ROCm/CUDA version the software is using
+            if pkg_name.upper() in [pkg.upper() for pkg in top_level_accelerator_packages]:
+                ec.eessi_gpu_dependency = (pkg_name.upper(), version.upper())
         # take into account that modluafooter may already be set
         if modluafooter in ec_dict:
             value = ec_dict[modluafooter]
@@ -2134,10 +2411,12 @@ PRE_CONFIGURE_HOOKS = {
     'MetaBAT': pre_configure_hook_metabat_filtered_zlib_dep,
     'OpenBLAS': pre_configure_hook_openblas_optarch_generic,
     'OpenMPI': pre_configure_hook_openmpi_ipv6,
+    'PETSc': pre_configure_hook_petsc,
     'PMIx': pre_configure_hook_pmix_ipv6,
     'PRRTE': pre_configure_hook_prrte_ipv6,
     'ROCm-LLVM': pre_configure_hook_llvm,
     'Score-P': pre_configure_hook_score_p,
+    'SymEngine': pre_configure_hook_symengine,
     'WRF': pre_configure_hook_wrf_aarch64,
     'Zoltan': pre_configure_hook_Zoltan,
 }
@@ -2149,8 +2428,10 @@ PRE_TEST_HOOKS = {
     'Highway': pre_test_hook_exclude_failing_test_Highway,
     'LAMMPS': pre_test_hook_lammps_ignore_failure_arm_generic,
     'SciPy-bundle': pre_test_hook_ignore_failing_tests_SciPybundle,
+    'Siesta': pre_test_hook_Siesta_ignore_failure_with_crosscompilation,
     'netCDF': pre_test_hook_ignore_failing_tests_netCDF,
     'OpenBabel': pre_test_hook_ignore_failing_tests_OpenBabel_a64fx,
+    'Perl': pre_test_hook_perl_increase_test_timeout,
     'PyTorch': pre_test_hook_increase_max_failed_tests_arm_PyTorch,
 }
 
@@ -2158,6 +2439,8 @@ PRE_SINGLE_EXTENSION_HOOKS = {
     'isoband': pre_single_extension_isoband,
     'numpy': pre_single_extension_numpy,
     'testthat': pre_single_extension_testthat,
+    'hf_xet': pre_single_extension_hf_xet,
+    'hf-xet': pre_single_extension_hf_xet,
 }
 
 POST_SINGLE_EXTENSION_HOOKS = {
@@ -2206,6 +2489,11 @@ PARALLELISM_LIMITS = {
     'MBX': {
         '*': (divide_by_factor, 2),
         CPU_TARGET_A64FX: (set_maximum, 1),
+    },
+    'PETSc': {
+        # PETSc test suite can be quite memory hungry,
+        # so reduce parallelism when running tests (also impacts build)
+        '*': (divide_by_factor, 2),
     },
     'PyTorch': {
         CPU_TARGET_AARCH64_GENERIC: (divide_by_factor, 2),
