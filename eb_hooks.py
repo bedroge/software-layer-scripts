@@ -2498,7 +2498,7 @@ PARALLELISM_LIMITS = {
         CPU_TARGET_A64FX: (set_maximum, 6),
     },
     'rocBLAS': {
-        '*': (set_maximum, 1),
+        '*': (set_maximum, 8),
     },
     'TensorFlow': {
         '*': (divide_by_factor, 2),
